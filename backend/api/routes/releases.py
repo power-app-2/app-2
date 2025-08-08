@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict
 from datetime import datetime
 import os
 import json
@@ -15,6 +15,7 @@ import uuid
 import shutil
 import random
 import logging
+import yaml
 
 # Import our new release system
 import sys
@@ -62,7 +63,7 @@ class ReleaseProgressResponse(BaseModel):
 # Original release creation model (for backward compatibility)
 class ReleaseCreate(BaseModel):
     version_name: str
-    dataset_id: str
+    dataset_ids: List[str]  # Changed from single dataset_id to multiple dataset_ids
     description: Optional[str] = ""
     transformations: List[dict] = []
     multiplier: int = 1
@@ -205,33 +206,60 @@ async def get_project_release_history(project_id: int, limit: int = 10, db: Sess
 @router.post("/releases/create")
 def create_release(payload: ReleaseCreate, db: Session = Depends(get_db)):
     try:
-        # Validate dataset
-        dataset = db.query(Dataset).filter(Dataset.id == payload.dataset_id).first()
-        if not dataset:
-            raise HTTPException(status_code=404, detail="Dataset not found")
+        # Validate all datasets exist and get project_id
+        datasets = []
+        project_id = None
+        
+        for dataset_id in payload.dataset_ids:
+            dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+            if not dataset:
+                raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
+            datasets.append(dataset)
+            
+            # Ensure all datasets belong to the same project
+            if project_id is None:
+                project_id = dataset.project_id
+            elif project_id != dataset.project_id:
+                raise HTTPException(status_code=400, detail="All datasets must belong to the same project")
 
-        # Create release controller
-        controller = create_release_controller(db)
+        # Get project info
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        # Generate release ID
+        release_id = str(uuid.uuid4())
         
         # Create release configuration
         config = ReleaseConfig(
-            project_id=dataset.project_id,
-            dataset_ids=[payload.dataset_id],
+            project_id=project_id,
+            dataset_ids=payload.dataset_ids,
             release_name=payload.version_name,
             description=payload.description,
-            export_format=payload.export_format,
+            export_format=payload.export_format.lower(),
             task_type=payload.task_type,
-            images_per_original=payload.multiplier,  # Set the multiplier correctly
-            sampling_strategy="intelligent",  # Default strategy
-            output_format="original",  # Use original format
-            include_original=True,  # Always include original images
-            split_sections=["train", "val", "test"]  # Default split sections
+            images_per_original=payload.multiplier,
+            sampling_strategy="intelligent",
+            output_format="original",
+            include_original=True,
+            split_sections=["train", "val", "test"],
+            preserve_original_splits=True  # Always preserve original splits
         )
         
-        # Generate the release using the proper controller
-        release_id = str(uuid.uuid4())  # Generate a new release ID
+        # Calculate image counts BEFORE creating release
+        total_original, split_counts = calculate_total_image_counts(db, payload.dataset_ids)
+        total_augmented = total_original * (payload.multiplier - 1) if payload.multiplier > 1 else 0
+        final_image_count = total_original * payload.multiplier
         
-        # Prepare data for DB record
+        # Create proper export path
+        projects_root = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "projects")
+        releases_dir = os.path.join(projects_root, project.name, "releases")
+        os.makedirs(releases_dir, exist_ok=True)
+        
+        zip_filename = f"{payload.version_name.replace(' ', '_')}_{payload.export_format.lower()}.zip"
+        model_path = os.path.join(releases_dir, zip_filename)
+        
+        # Prepare config data for DB
         config_data = {
             "version_name": payload.version_name,
             "export_format": payload.export_format,
@@ -241,37 +269,20 @@ def create_release(payload: ReleaseCreate, db: Session = Depends(get_db)):
             "preserve_annotations": payload.preserve_annotations,
             "include_images": payload.include_images,
             "include_annotations": payload.include_annotations,
-            "verified_only": payload.verified_only
+            "verified_only": payload.verified_only,
+            "dataset_ids": payload.dataset_ids,
+            "split_counts": split_counts
         }
         
-        # Set default values for the release record
-        total_original = 0
-        total_augmented = 0
-        final_image_count = 0
-        
-        # Create a proper export path for the model
-        project_name = db.query(Project).filter(Project.id == dataset.project_id).first().name
-        
-        # Use the correct path structure that matches the release_controller.py
-        projects_root = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "projects")
-        releases_dir = os.path.join(projects_root, project_name, "releases")
-        os.makedirs(releases_dir, exist_ok=True)
-        
-        zip_filename = f"{payload.version_name.replace(' ', '_')}_{payload.export_format}.zip"
-        model_path = os.path.join(releases_dir, zip_filename)
-        
-        # Log the path for debugging
-        logger.info(f"Setting release model_path to: {model_path}")
-        
-        # Save release to DB
+        # Create release record in database
         release = Release(
             id=release_id,
-            project_id=dataset.project_id,
+            project_id=project_id,
             name=payload.version_name,
             description=payload.description,
             export_format=payload.export_format,
             task_type=payload.task_type,
-            datasets_used=[payload.dataset_id],
+            datasets_used=payload.dataset_ids,  # Store all dataset IDs
             config=config_data,
             total_original_images=total_original,
             total_augmented_images=total_augmented,
@@ -280,9 +291,32 @@ def create_release(payload: ReleaseCreate, db: Session = Depends(get_db)):
             created_at=datetime.now(),
         )
         db.add(release)
-        db.commit()
+        db.flush()  # Get the ID without committing
         
-        # Update transformations status to COMPLETED and link to release
+        # NOW CREATE THE ACTUAL RELEASE ZIP FILE
+        try:
+            logger.info(f"Creating release ZIP for {len(payload.dataset_ids)} datasets with {payload.multiplier}x multiplier")
+            
+            # Create the complete release ZIP with proper dataset aggregation
+            create_complete_release_zip(
+                db=db,
+                release_id=release_id,
+                dataset_ids=payload.dataset_ids,
+                project_name=project.name,
+                config=config,
+                transformations=payload.transformations,
+                multiplier=payload.multiplier,
+                zip_path=model_path
+            )
+            
+            logger.info(f"Successfully created release ZIP at: {model_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to create release ZIP: {str(e)}")
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Failed to create release: {str(e)}")
+        
+        # Update transformations status
         pending_transformations = db.query(ImageTransformation).filter(
             ImageTransformation.release_version == payload.version_name,
             ImageTransformation.status == "PENDING"
@@ -292,30 +326,67 @@ def create_release(payload: ReleaseCreate, db: Session = Depends(get_db)):
             transformation.status = "COMPLETED"
             transformation.release_id = release_id
         
+        # Commit all changes
         db.commit()
-
-        # Get the release record to return the model_path
-        release = db.query(Release).filter(Release.id == release_id).first()
         
-        # Return the release ID and model_path
+        logger.info(f"Release created successfully: {release_id} with {final_image_count} total images")
+        
+        # Get the created release with all fields for frontend
+        created_release = db.query(Release).filter(Release.id == release_id).first()
+        
         return {
-            "message": "Release created", 
+            "message": "Release created successfully", 
             "release_id": release_id,
-            "model_path": release.model_path if release else None
+            "model_path": model_path,
+            "image_counts": {
+                "original": total_original,
+                "augmented": total_augmented,
+                "final": final_image_count
+            },
+            "datasets_processed": len(payload.dataset_ids),
+            # Add release object with all fields that DownloadModal expects
+            "release": {
+                "id": created_release.id,
+                "name": created_release.name,
+                "version_name": created_release.name,
+                "description": created_release.description,
+                "export_format": created_release.export_format,
+                "task_type": created_release.task_type,
+                "final_image_count": created_release.final_image_count,
+                "total_original_images": created_release.total_original_images,
+                "total_augmented_images": created_release.total_augmented_images,
+                "original_image_count": created_release.total_original_images,  # For backward compatibility
+                "augmented_image_count": created_release.total_augmented_images,  # For backward compatibility
+                "created_at": created_release.created_at,
+                "model_path": created_release.model_path,
+                "datasets_used": created_release.datasets_used,
+                "project_id": created_release.project_id
+            }
         }
 
+    except HTTPException:
+        raise
     except SQLAlchemyError as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Database error in create_release: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        db.rollback()
+        logger.error(f"Unexpected error in create_release: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 @router.get("/releases/{dataset_id}/history")
 def get_release_history(dataset_id: str, db: Session = Depends(get_db)):
-    # Find releases that include this dataset
+    # Find releases that include this dataset (handle both single and multiple dataset releases)
     releases = db.query(Release).filter(
         Release.datasets_used.contains([dataset_id])
     ).order_by(Release.created_at.desc()).all()
+    
+    # If no releases found with new format, try old format (backward compatibility)
+    if not releases:
+        releases = db.query(Release).filter(
+            Release.datasets_used.like(f'%{dataset_id}%')
+        ).order_by(Release.created_at.desc()).all()
     
     return [
         {
@@ -325,7 +396,41 @@ def get_release_history(dataset_id: str, db: Session = Depends(get_db)):
             "task_type": r.task_type,
             "original_image_count": r.total_original_images,
             "augmented_image_count": r.total_augmented_images,
+            "final_image_count": r.final_image_count,  # Add this field for frontend
+            "total_original_images": r.total_original_images,  # Add this field for frontend
+            "total_augmented_images": r.total_augmented_images,  # Add this field for frontend
             "created_at": r.created_at,
+            "model_path": r.model_path,  # Add this for download modal
+            "description": r.description,  # Add this for download modal
+            "datasets_used": r.datasets_used,  # Add this to show which datasets were used
+        }
+        for r in releases
+    ]
+
+@router.get("/projects/{project_id}/releases")
+def get_project_releases(project_id: str, db: Session = Depends(get_db)):
+    """Get all releases for a project (better for multi-dataset releases)"""
+    releases = db.query(Release).filter(
+        Release.project_id == project_id
+    ).order_by(Release.created_at.desc()).all()
+    
+    return [
+        {
+            "id": r.id,
+            "name": r.name,
+            "version_name": r.name,  # For backward compatibility
+            "export_format": r.export_format,
+            "task_type": r.task_type,
+            "original_image_count": r.total_original_images,
+            "augmented_image_count": r.total_augmented_images,
+            "final_image_count": r.final_image_count,
+            "total_original_images": r.total_original_images,
+            "total_augmented_images": r.total_augmented_images,
+            "created_at": r.created_at,
+            "model_path": r.model_path,
+            "description": r.description,
+            "datasets_used": r.datasets_used,
+            "project_id": r.project_id,
         }
         for r in releases
     ]
@@ -704,3 +809,280 @@ async def update_release_version(old_version: str, new_version_data: dict):
     except Exception as e:
         logger.error(f"Failed to update release version: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to update release version: {str(e)}")
+
+
+# HELPER FUNCTIONS FOR PROPER RELEASE CREATION
+
+def calculate_total_image_counts(db: Session, dataset_ids: List[str]) -> Tuple[int, Dict[str, int]]:
+    """Calculate total image counts across all datasets with split breakdown"""
+    total_original = 0
+    split_counts = {"train": 0, "val": 0, "test": 0}
+    
+    for dataset_id in dataset_ids:
+        # Count images by split for this dataset
+        train_count = db.query(Image).filter(
+            Image.dataset_id == dataset_id,
+            Image.split_type == 'train',
+            Image.is_labeled == True
+        ).count()
+        
+        val_count = db.query(Image).filter(
+            Image.dataset_id == dataset_id,
+            Image.split_type == 'val',
+            Image.is_labeled == True
+        ).count()
+        
+        test_count = db.query(Image).filter(
+            Image.dataset_id == dataset_id,
+            Image.split_type == 'test',
+            Image.is_labeled == True
+        ).count()
+        
+        # Add to totals
+        split_counts["train"] += train_count
+        split_counts["val"] += val_count
+        split_counts["test"] += test_count
+        total_original += train_count + val_count + test_count
+        
+        logger.info(f"Dataset {dataset_id}: train={train_count}, val={val_count}, test={test_count}")
+    
+    logger.info(f"Total across all datasets: {total_original} images, splits: {split_counts}")
+    return total_original, split_counts
+
+
+def create_complete_release_zip(
+    db: Session,
+    release_id: str,
+    dataset_ids: List[str],
+    project_name: str,
+    config: ReleaseConfig,
+    transformations: List[dict],
+    multiplier: int,
+    zip_path: str
+):
+    """Create complete release ZIP with proper dataset aggregation and augmentation"""
+    import tempfile
+    import zipfile
+    from PIL import Image as PILImage
+    import io
+    import yaml
+    
+    logger.info(f"Creating complete release ZIP for {len(dataset_ids)} datasets")
+    
+    # Create temporary directory for staging
+    with tempfile.TemporaryDirectory() as temp_dir:
+        staging_dir = os.path.join(temp_dir, "staging")
+        os.makedirs(staging_dir, exist_ok=True)
+        
+        # Create split directories
+        for split in ["train", "val", "test"]:
+            os.makedirs(os.path.join(staging_dir, "images", split), exist_ok=True)
+            os.makedirs(os.path.join(staging_dir, "labels", split), exist_ok=True)
+        
+        # Step 1: Aggregate images by split across all datasets
+        all_images_by_split = {"train": [], "val": [], "test": []}
+        class_names = set()
+        
+        for dataset_id in dataset_ids:
+            dataset = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+            if not dataset:
+                continue
+                
+            logger.info(f"Processing dataset: {dataset.name}")
+            
+            # Get dataset path
+            dataset_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                "projects", project_name, "dataset", dataset.name
+            )
+            
+            if not os.path.exists(dataset_path):
+                logger.warning(f"Dataset path not found: {dataset_path}")
+                continue
+            
+            # Process each split
+            for split in ["train", "val", "test"]:
+                split_path = os.path.join(dataset_path, split)
+                if not os.path.exists(split_path):
+                    continue
+                
+                # Get all images in this split
+                for image_file in os.listdir(split_path):
+                    if image_file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                        image_path = os.path.join(split_path, image_file)
+                        
+                        # Get corresponding annotations from database
+                        db_image = db.query(Image).filter(
+                            Image.dataset_id == dataset_id,
+                            Image.filename == image_file,
+                            Image.split_type == split,
+                            Image.is_labeled == True
+                        ).first()
+                        
+                        if db_image:
+                            annotations = db.query(Annotation).filter(
+                                Annotation.image_id == db_image.id
+                            ).all()
+                            
+                            # Collect class names
+                            for ann in annotations:
+                                if hasattr(ann, 'class_name') and ann.class_name:
+                                    class_names.add(ann.class_name)
+                                elif hasattr(ann, 'class_id'):
+                                    class_names.add(f"class_{ann.class_id}")
+                            
+                            all_images_by_split[split].append({
+                                "image_path": image_path,
+                                "filename": image_file,
+                                "annotations": annotations,
+                                "db_image": db_image,
+                                "dataset_name": dataset.name
+                            })
+        
+        logger.info(f"Aggregated images: train={len(all_images_by_split['train'])}, val={len(all_images_by_split['val'])}, test={len(all_images_by_split['test'])}")
+        
+        # Step 2: Apply augmentation to each split
+        final_image_count = 0
+        
+        for split, images in all_images_by_split.items():
+            if not images:
+                continue
+                
+            logger.info(f"Processing {split} split with {len(images)} images, {multiplier}x multiplier")
+            
+            for img_data in images:
+                # Copy original image
+                original_filename = img_data["filename"]
+                original_path = img_data["image_path"]
+                
+                if os.path.exists(original_path):
+                    # Copy original image
+                    dest_path = os.path.join(staging_dir, "images", split, original_filename)
+                    shutil.copy2(original_path, dest_path)
+                    
+                    # Create label file
+                    label_content = create_yolo_label_content(img_data["annotations"], img_data["db_image"])
+                    label_filename = os.path.splitext(original_filename)[0] + ".txt"
+                    label_path = os.path.join(staging_dir, "labels", split, label_filename)
+                    
+                    with open(label_path, 'w') as f:
+                        f.write(label_content)
+                    
+                    final_image_count += 1
+                    
+                    # Generate augmented versions
+                    if multiplier > 1:
+                        for aug_idx in range(1, multiplier):
+                            aug_filename = f"{os.path.splitext(original_filename)[0]}_aug_{aug_idx}{os.path.splitext(original_filename)[1]}"
+                            aug_dest_path = os.path.join(staging_dir, "images", split, aug_filename)
+                            
+                            # Apply transformations
+                            augmented_image = apply_transformations_to_image(original_path, transformations)
+                            if augmented_image:
+                                augmented_image.save(aug_dest_path)
+                                
+                                # Create corresponding label (same as original for now)
+                                aug_label_filename = os.path.splitext(aug_filename)[0] + ".txt"
+                                aug_label_path = os.path.join(staging_dir, "labels", split, aug_label_filename)
+                                
+                                with open(aug_label_path, 'w') as f:
+                                    f.write(label_content)
+                                
+                                final_image_count += 1
+        
+        # Step 3: Create data.yaml
+        class_list = sorted(list(class_names)) if class_names else ["class_0"]
+        data_yaml = {
+            "path": ".",
+            "train": "images/train" if all_images_by_split["train"] else None,
+            "val": "images/val" if all_images_by_split["val"] else None,
+            "test": "images/test" if all_images_by_split["test"] else None,
+            "nc": len(class_list),
+            "names": class_list
+        }
+        
+        # Remove None values
+        data_yaml = {k: v for k, v in data_yaml.items() if v is not None}
+        
+        data_yaml_path = os.path.join(staging_dir, "data.yaml")
+        with open(data_yaml_path, 'w') as f:
+            yaml.dump(data_yaml, f, default_flow_style=False)
+        
+        # Step 4: Create ZIP file
+        logger.info(f"Creating ZIP file with {final_image_count} total images")
+        
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(staging_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arc_path = os.path.relpath(file_path, staging_dir)
+                    zipf.write(file_path, arc_path)
+        
+        logger.info(f"Successfully created ZIP file: {zip_path}")
+
+
+def create_yolo_label_content(annotations, db_image) -> str:
+    """Create YOLO format label content from database annotations"""
+    if not annotations:
+        return ""
+    
+    lines = []
+    image_width = getattr(db_image, 'width', 640)  # Default width if not available
+    image_height = getattr(db_image, 'height', 480)  # Default height if not available
+    
+    for ann in annotations:
+        # Get class ID (default to 0 if not available)
+        class_id = getattr(ann, 'class_id', 0)
+        
+        # Get bounding box coordinates
+        if hasattr(ann, 'bbox') and ann.bbox:
+            # Parse bbox if it's a string
+            if isinstance(ann.bbox, str):
+                try:
+                    bbox = json.loads(ann.bbox)
+                except:
+                    bbox = [0.25, 0.25, 0.75, 0.75]  # Default bbox
+            else:
+                bbox = ann.bbox
+            
+            # Convert to YOLO format (normalized center coordinates)
+            x_min, y_min, x_max, y_max = bbox[:4]
+            
+            center_x = (x_min + x_max) / 2.0 / image_width
+            center_y = (y_min + y_max) / 2.0 / image_height
+            width = (x_max - x_min) / image_width
+            height = (y_max - y_min) / image_height
+            
+            # Ensure values are within [0, 1]
+            center_x = max(0, min(1, center_x))
+            center_y = max(0, min(1, center_y))
+            width = max(0, min(1, width))
+            height = max(0, min(1, height))
+            
+            lines.append(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}")
+        else:
+            # Default annotation if no bbox available
+            lines.append(f"{class_id} 0.5 0.5 0.3 0.3")
+    
+    return "\n".join(lines)
+
+
+def apply_transformations_to_image(image_path: str, transformations: List[dict]):
+    """Apply transformations to an image"""
+    try:
+        from PIL import Image as PILImage
+        
+        image = PILImage.open(image_path)
+        
+        for transform in transformations:
+            if transform.get("type") == "rotate":
+                angle = transform.get("params", {}).get("angle", 0)
+                if angle != 0:
+                    image = image.rotate(angle, expand=True)
+            # Add more transformations as needed
+        
+        return image
+        
+    except Exception as e:
+        logger.error(f"Failed to apply transformations to {image_path}: {str(e)}")
+        return None
