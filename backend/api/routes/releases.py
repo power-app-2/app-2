@@ -976,8 +976,11 @@ def create_complete_release_zip(
                             aug_filename = f"{os.path.splitext(original_filename)[0]}_aug_{aug_idx}{os.path.splitext(original_filename)[1]}"
                             aug_dest_path = os.path.join(staging_dir, "images", split, aug_filename)
                             
+                            # ✅ Generate different transformations for each augmented image
+                            aug_transformations = generate_augmented_transformations(transformations, aug_idx)
+                            
                             # Apply transformations
-                            augmented_image = apply_transformations_to_image(original_path, transformations)
+                            augmented_image = apply_transformations_to_image(original_path, aug_transformations)
                             if augmented_image:
                                 augmented_image.save(aug_dest_path)
                                 
@@ -1065,6 +1068,46 @@ def create_yolo_label_content(annotations, db_image) -> str:
             lines.append(f"{class_id} 0.5 0.5 0.3 0.3")
     
     return "\n".join(lines)
+
+
+def generate_augmented_transformations(base_transformations: List[dict], aug_idx: int) -> List[dict]:
+    """
+    Generate different transformation parameters for each augmented image
+    
+    For rotation 90°:
+    - aug_idx=1 → -90° rotation  
+    - aug_idx=2 → +90° rotation
+    - aug_idx=3 → 180° rotation
+    - etc.
+    """
+    augmented_transformations = []
+    
+    for transform in base_transformations:
+        if transform.get("type") == "rotate":
+            base_angle = transform.get("params", {}).get("angle", 0)
+            
+            # Generate different angles for each augmentation
+            if aug_idx == 1:
+                # First augmentation: negative angle
+                new_angle = -base_angle
+            elif aug_idx == 2:
+                # Second augmentation: positive angle  
+                new_angle = base_angle
+            else:
+                # Additional augmentations: multiples
+                new_angle = base_angle * aug_idx
+                
+            augmented_transform = {
+                "type": "rotate",
+                "params": {"angle": new_angle}
+            }
+            augmented_transformations.append(augmented_transform)
+            
+        else:
+            # For other transformations, keep the same for now
+            augmented_transformations.append(transform.copy())
+    
+    return augmented_transformations
 
 
 def apply_transformations_to_image(image_path: str, transformations: List[dict]):
