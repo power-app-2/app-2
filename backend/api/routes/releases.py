@@ -251,8 +251,8 @@ def create_release(payload: ReleaseCreate, db: Session = Depends(get_db)):
         total_augmented = total_original * (payload.multiplier - 1) if payload.multiplier > 1 else 0
         final_image_count = total_original * payload.multiplier
         
-        # Create proper export path
-        projects_root = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "projects")
+        # Create proper export path - go up 4 levels from backend/api/routes/releases.py to app-2 root
+        projects_root = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "projects")
         releases_dir = os.path.join(projects_root, project.name, "releases")
         os.makedirs(releases_dir, exist_ok=True)
         
@@ -819,22 +819,22 @@ def calculate_total_image_counts(db: Session, dataset_ids: List[str]) -> Tuple[i
     split_counts = {"train": 0, "val": 0, "test": 0}
     
     for dataset_id in dataset_ids:
-        # Count images by split for this dataset
+        # Count images by split for this dataset (use split_section instead of split_type)
         train_count = db.query(Image).filter(
             Image.dataset_id == dataset_id,
-            Image.split_type == 'train',
+            Image.split_section == 'train',
             Image.is_labeled == True
         ).count()
         
         val_count = db.query(Image).filter(
             Image.dataset_id == dataset_id,
-            Image.split_type == 'val',
+            Image.split_section == 'val',
             Image.is_labeled == True
         ).count()
         
         test_count = db.query(Image).filter(
             Image.dataset_id == dataset_id,
-            Image.split_type == 'test',
+            Image.split_section == 'test',
             Image.is_labeled == True
         ).count()
         
@@ -890,9 +890,9 @@ def create_complete_release_zip(
                 
             logger.info(f"Processing dataset: {dataset.name}")
             
-            # Get dataset path
+            # Get dataset path - go up one more level to get to app-2 root
             dataset_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
                 "projects", project_name, "dataset", dataset.name
             )
             
@@ -915,7 +915,7 @@ def create_complete_release_zip(
                         db_image = db.query(Image).filter(
                             Image.dataset_id == dataset_id,
                             Image.filename == image_file,
-                            Image.split_type == split,
+                            Image.split_section == split,  # Use split_section instead of split_type
                             Image.is_labeled == True
                         ).first()
                         
