@@ -1121,7 +1121,8 @@ def apply_transformations_to_image(image_path: str, transformations: List[dict])
             if transform.get("type") == "rotate":
                 angle = transform.get("params", {}).get("angle", 0)
                 if angle != 0:
-                    image = image.rotate(angle, expand=True)
+                    # ✅ DATA AUGMENTATION: Keep same dimensions, white background fill
+                    image = image.rotate(angle, expand=False, fillcolor='white')
             # Add more transformations as needed
         
         return image
