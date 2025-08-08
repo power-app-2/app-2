@@ -570,14 +570,15 @@ const ReleaseSection = ({ projectId, datasetId }) => {
       
       // Prepare release data for API using the values from the release config form
       const releaseData = {
-        version_name: releaseConfig.name,
-        dataset_id: releaseConfig.selectedDatasets[0], // ✅ use just the first selected one
+        name: releaseConfig.name, // ✅ Fixed: backend expects "name" not "version_name"
+        dataset_ids: releaseConfig.selectedDatasets, // ✅ Fixed: send all selected datasets
         transformations: transformations,
         multiplier: releaseConfig.multiplier,
         target_split: { train: 70, val: 20, test: 10 }, // Default split
         preserve_annotations: releaseConfig.preserveAnnotations,
         task_type: releaseConfig.taskType || 'object_detection', // Use the task type from the form
-        export_format: releaseConfig.exportFormat || 'yolo_detection' // Use the export format from the form
+        export_format: releaseConfig.exportFormat || 'yolo_detection', // Use the export format from the form
+        project_id: currentProject?.id || 'gevis' // ✅ Fixed: add required project_id
       };
 
       console.log('Creating release with config:', releaseData);
@@ -595,10 +596,11 @@ const ReleaseSection = ({ projectId, datasetId }) => {
       loadingMessage();
 
       if (response.ok) {
-        const createdRelease = await response.json();
-        console.log('Release created successfully:', JSON.stringify(createdRelease, null, 2));
+        const responseData = await response.json();
+        console.log('Release created successfully:', JSON.stringify(responseData, null, 2));
         
-        // Log the model_path from the response
+        // ✅ Fixed: Handle nested response format
+        const createdRelease = responseData.release || responseData;
         console.log('Model path from response:', createdRelease.model_path);
         
         // Show success message
